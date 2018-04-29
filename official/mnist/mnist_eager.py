@@ -31,12 +31,12 @@ import os
 import sys
 import time
 
-import tensorflow as tf
-import tensorflow.contrib.eager as tfe
-import mnist
-import dataset
+import tensorflow as tf  # pylint: disable=g-bad-import-order
+import tensorflow.contrib.eager as tfe  # pylint: disable=g-bad-import-order
 
-FLAGS = None
+from official.mnist import dataset as mnist_dataset
+from official.mnist import mnist
+from official.utils.arg_parsers import parsers
 
 
 def loss(logits, labels):
@@ -95,30 +95,38 @@ def test(model, dataset):
     tf.contrib.summary.scalar('accuracy', accuracy.result())
 
 
-def main(_):
+def main(argv):
+  parser = MNISTEagerArgParser()
+  flags = parser.parse_args(args=argv[1:])
+
   tfe.enable_eager_execution()
 
+  # Automatically determine device and data_format
   (device, data_format) = ('/gpu:0', 'channels_first')
-  if FLAGS.no_gpu or tfe.num_gpus() <= 0:
+  if flags.no_gpu or tfe.num_gpus() <= 0:
     (device, data_format) = ('/cpu:0', 'channels_last')
+  # If data_format is defined in FLAGS, overwrite automatically set value.
+  if flags.data_format is not None:
+    data_format = flags.data_format
   print('Using device %s, and data format %s.' % (device, data_format))
 
   # Load the datasets
-  train_ds = dataset.train(FLAGS.data_dir).shuffle(60000).batch(
-      FLAGS.batch_size)
-  test_ds = dataset.test(FLAGS.data_dir).batch(FLAGS.batch_size)
+  train_ds = mnist_dataset.train(flags.data_dir).shuffle(60000).batch(
+      flags.batch_size)
+  test_ds = mnist_dataset.test(flags.data_dir).batch(flags.batch_size)
 
   # Create the model and optimizer
-  model = mnist.Model(data_format)
-  optimizer = tf.train.MomentumOptimizer(FLAGS.lr, FLAGS.momentum)
+  model = mnist.create_model(data_format)
+  optimizer = tf.train.MomentumOptimizer(flags.lr, flags.momentum)
 
-  if FLAGS.output_dir:
+  # Create file writers for writing TensorBoard summaries.
+  if flags.output_dir:
     # Create directories to which summaries will be written
     # tensorboard --logdir=<output_dir>
     # can then be used to see the recorded summaries.
-    train_dir = os.path.join(FLAGS.output_dir, 'train')
-    test_dir = os.path.join(FLAGS.output_dir, 'eval')
-    tf.gfile.MakeDirs(FLAGS.output_dir)
+    train_dir = os.path.join(flags.output_dir, 'train')
+    test_dir = os.path.join(flags.output_dir, 'eval')
+    tf.gfile.MakeDirs(flags.output_dir)
   else:
     train_dir = None
     test_dir = None
@@ -126,18 +134,21 @@ def main(_):
       train_dir, flush_millis=10000)
   test_summary_writer = tf.contrib.summary.create_file_writer(
       test_dir, flush_millis=10000, name='test')
-  checkpoint_prefix = os.path.join(FLAGS.checkpoint_dir, 'ckpt')
+
+  # Create and restore checkpoint (if one exists on the path)
+  checkpoint_prefix = os.path.join(flags.model_dir, 'ckpt')
   step_counter = tf.train.get_or_create_global_step()
   checkpoint = tfe.Checkpoint(
       model=model, optimizer=optimizer, step_counter=step_counter)
   # Restore variables on creation if a checkpoint exists.
-  checkpoint.restore(tf.train.latest_checkpoint(FLAGS.checkpoint_dir))
-  # Train and evaluate for 10 epochs.
+  checkpoint.restore(tf.train.latest_checkpoint(flags.model_dir))
+
+  # Train and evaluate for a set number of epochs.
   with tf.device(device):
-    for _ in range(10):
+    for _ in range(flags.train_epochs):
       start = time.time()
       with summary_writer.as_default():
-        train(model, optimizer, train_ds, step_counter, FLAGS.log_interval)
+        train(model, optimizer, train_ds, step_counter, flags.log_interval)
       end = time.time()
       print('\nTrain time for epoch #%d (%d total steps): %f' %
             (checkpoint.save_counter.numpy() + 1,
@@ -148,54 +159,50 @@ def main(_):
       checkpoint.save(checkpoint_prefix)
 
 
-if __name__ == '__main__':
-  parser = argparse.ArgumentParser()
-  parser.add_argument(
-      '--data_dir',
-      type=str,
-      default='/tmp/tensorflow/mnist/input_data',
-      help='Directory for storing input data')
-  parser.add_argument(
-      '--batch_size',
-      type=int,
-      default=100,
-      metavar='N',
-      help='input batch size for training (default: 100)')
-  parser.add_argument(
-      '--log_interval',
-      type=int,
-      default=10,
-      metavar='N',
-      help='how many batches to wait before logging training status')
-  parser.add_argument(
-      '--output_dir',
-      type=str,
-      default=None,
-      metavar='N',
-      help='Directory to write TensorBoard summaries')
-  parser.add_argument(
-      '--checkpoint_dir',
-      type=str,
-      default='/tmp/tensorflow/mnist/checkpoints/',
-      metavar='N',
-      help='Directory to save checkpoints in (once per epoch)')
-  parser.add_argument(
-      '--lr',
-      type=float,
-      default=0.01,
-      metavar='LR',
-      help='learning rate (default: 0.01)')
-  parser.add_argument(
-      '--momentum',
-      type=float,
-      default=0.5,
-      metavar='M',
-      help='SGD momentum (default: 0.5)')
-  parser.add_argument(
-      '--no_gpu',
-      action='store_true',
-      default=False,
-      help='disables GPU usage even if a GPU is available')
+class MNISTEagerArgParser(argparse.ArgumentParser):
+  """Argument parser for running MNIST model with eager training loop."""
 
-  FLAGS, unparsed = parser.parse_known_args()
-  tf.app.run(main=main, argv=[sys.argv[0]] + unparsed)
+  def __init__(self):
+    super(MNISTEagerArgParser, self).__init__(parents=[
+        parsers.EagerParser(),
+        parsers.ImageModelParser()])
+
+    self.add_argument(
+        '--log_interval', '-li',
+        type=int,
+        default=10,
+        metavar='N',
+        help='[default: %(default)s] batches between logging training status')
+    self.add_argument(
+        '--output_dir', '-od',
+        type=str,
+        default=None,
+        metavar='<OD>',
+        help='[default: %(default)s] Directory to write TensorBoard summaries')
+    self.add_argument(
+        '--lr', '-lr',
+        type=float,
+        default=0.01,
+        metavar='<LR>',
+        help='[default: %(default)s] learning rate')
+    self.add_argument(
+        '--momentum', '-m',
+        type=float,
+        default=0.5,
+        metavar='<M>',
+        help='[default: %(default)s] SGD momentum')
+    self.add_argument(
+        '--no_gpu', '-nogpu',
+        action='store_true',
+        default=False,
+        help='disables GPU usage even if a GPU is available')
+
+    self.set_defaults(
+        data_dir='/tmp/tensorflow/mnist/input_data',
+        model_dir='/tmp/tensorflow/mnist/checkpoints/',
+        batch_size=100,
+        train_epochs=10,
+    )
+
+if __name__ == '__main__':
+  main(argv=sys.argv)
